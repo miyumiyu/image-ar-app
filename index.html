@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Privacy Avatar Cam v1.0</title>
+    <title>Privacy Avatar Cam v1.1</title>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -423,17 +423,29 @@
                 ctx.restore();
 
                 const landmarks = results.multiFaceLandmarks[0];
-                const nose = landmarks[1];
-                const leftCheek = landmarks[234];
-                const rightCheek = landmarks[454];
-                const faceWidthRel = distance(leftCheek, rightCheek);
+                // ★ 位置計算ロジックの修正 ★
+                // 鼻先(1)ではなく、耳付近(234, 454)の中点を使って、顔の回転による位置ずれを軽減する
+                const leftSide = landmarks[234];
+                const rightSide = landmarks[454];
+                
+                // 座標計算
+                // ビデオは左右反転(scaleX -1)で描画しているが、座標系はそのまま
+                // 中央値を使うことで、顔を横に向けた時の「鼻の移動」によるズレを抑える
+                const midX = (leftSide.x + rightSide.x) / 2;
+                const midY = (leftSide.y + rightSide.y) / 2;
+                
+                const faceWidthRel = distance(leftSide, rightSide);
                 const faceWidthPx = faceWidthRel * width;
                 lastFaceWidthPxRef.current = faceWidthPx;
+
+                // 回転角度計算（これは目の位置を使うのが一般的）
                 const dx = landmarks[263].x - landmarks[33].x;
                 const dy = landmarks[263].y - landmarks[33].y;
                 const angle = Math.atan2(dy, dx); 
-                const x = nose.x * width;
-                const y = nose.y * height;
+
+                // 描画中心座標
+                const x = midX * width;
+                const y = midY * height;
 
                 const rEyeH = distance(landmarks[33], landmarks[133]);
                 const rEyeV = distance(landmarks[159], landmarks[145]);
@@ -476,6 +488,9 @@
                     ctx.save();
                     const offsetX = configRef.current.offsetX * (faceWidthPx / 100); 
                     const offsetY = configRef.current.offsetY * (faceWidthPx / 100);
+                    
+                    // ビデオが反転しているので、座標xは「画面右端からの距離」になるイメージ
+                    // xは0-1正規化座標*width。
                     ctx.translate(width - x + offsetX, y + offsetY); 
                     ctx.rotate(-angle); 
                     ctx.drawImage(imgToDraw, -size / 2, -size / 2, size, size);
@@ -681,7 +696,7 @@
                                 <div className="absolute top-4 left-4 bg-black/60 backdrop-blur-md px-4 py-2 rounded-full text-sm font-mono text-green-400 border border-white/10 flex items-center gap-3 shadow-lg z-30">
                                     <span className={`w-2.5 h-2.5 rounded-full ${currentExpression !== 'neutral' ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`}></span>
                                     <span className="font-bold">{EXPRESSION_TYPES[currentExpression]?.label}</span>
-                                    <span className="text-[10px] text-gray-500">v1.0</span>
+                                    <span className="text-[10px] text-gray-500">v1.1</span>
                                 </div>
                             )}
 
