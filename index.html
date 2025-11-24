@@ -1,0 +1,918 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Camera, RefreshCw, Upload, Move, Eye, EyeOff, Mic, Smile, Settings, ArrowUp, ArrowDown, ZoomIn, Sliders, ToggleLeft, ToggleRight, X, Video, VideoOff, Clock, UserX, Layers, UserMinus, ScanEye, ArrowUpFromLine, Scissors } from 'lucide-react';
+
+// --- MediaPipe Helper Types ---
+const DEFAULT_Placeholder = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200' viewBox='0 0 200 200'%3E%3Ccircle cx='100' cy='100' r='100' fill='%23fbbf24' /%3E%3Ccircle cx='65' cy='75' r='15' fill='%23000' /%3E%3Ccircle cx='135' cy='75' r='15' fill='%23000' /%3E%3Cpath d='M65 130 Q100 160 135 130' stroke='%23000' stroke-width='10' fill='none' /%3E%3C/svg%3E";
+
+const EXPRESSION_TYPES = {
+  neutral: { id: 'neutral', label: '通常時', icon: <Smile size={18} /> },
+  winkLeft: { id: 'winkLeft', label: '左目閉じ', icon: <EyeOff size={18} className="scale-x-[-1]" /> },
+  winkRight: { id: 'winkRight', label: '右目閉じ', icon: <EyeOff size={18} /> },
+  mouthOpen: { id: 'mouthOpen', label: '口あけ', icon: <Mic size={18} /> },
+};
+
+type ExpressionKey = keyof typeof EXPRESSION_TYPES;
+
+// 顔の輪郭用のランドマークインデックス
+const FACE_OVAL_INDICES = [
+  10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109
+];
+
+interface Config {
+  scale: number;
+  offsetX: number;
+  offsetY: number;
+  eyeClosedThreshold: number;
+  mouthOpenThreshold: number;
+  triggerDuration: number;
+  enableBodyMask: boolean; // 手などを前に表示するか
+  maskThreshold: number;   // 体マスクの判定しきい値
+  faceHoleScale: number;   // 顔部分をマスクからくり抜くサイズ
+  showMaskDebug: boolean;  // マスク範囲を赤く表示するか
+  maskCutoffOffset: number; // マスク削除ラインの微調整用
+}
+
+interface ImageState {
+  [key: string]: string | null;
+}
+
+const App = () => {
+  // --- States ---
+  const [images, setImages] = useState<ImageState>({
+    neutral: null,
+    winkLeft: null,
+    winkRight: null,
+    mouthOpen: null,
+  });
+  
+  const [standbyImage, setStandbyImage] = useState<string | null>(null);
+  const [priorityOrder, setPriorityOrder] = useState<ExpressionKey[]>(['mouthOpen', 'winkLeft', 'winkRight', 'neutral']);
+  
+  const [enabledExpressions, setEnabledExpressions] = useState<Record<string, boolean>>({
+    neutral: true,
+    winkLeft: true,
+    winkRight: true,
+    mouthOpen: true,
+  });
+
+  const [config, setConfig] = useState<Config>({
+    scale: 1.5,
+    offsetX: 0,
+    offsetY: 0,
+    eyeClosedThreshold: 0.12,
+    mouthOpenThreshold: 0.3,
+    triggerDuration: 200,
+    enableBodyMask: true,
+    maskThreshold: 0.5,   
+    faceHoleScale: 1.1,
+    showMaskDebug: false, 
+    maskCutoffOffset: 0, // デフォルト0 (あごの位置)
+  });
+
+  const [showUI, setShowUI] = useState(true);
+  const [isCameraOn, setIsCameraOn] = useState(false);
+  const [isFaceDetected, setIsFaceDetected] = useState(false);
+
+  // Refs
+  const configRef = useRef<Config>(config);
+  const enabledExpressionsRef = useRef(enabledExpressions);
+  const priorityOrderRef = useRef(priorityOrder);
+  const standbyImageRef = useRef<HTMLImageElement | null>(null);
+  const isCameraOnRef = useRef(isCameraOn); 
+
+  useEffect(() => { configRef.current = config; }, [config]);
+  useEffect(() => { enabledExpressionsRef.current = enabledExpressions; }, [enabledExpressions]);
+  useEffect(() => { priorityOrderRef.current = priorityOrder; }, [priorityOrder]);
+  useEffect(() => { isCameraOnRef.current = isCameraOn; }, [isCameraOn]);
+
+  useEffect(() => {
+    if (standbyImage) {
+      const img = new Image();
+      img.src = standbyImage;
+      standbyImageRef.current = img;
+    } else {
+      standbyImageRef.current = null;
+    }
+  }, [standbyImage]);
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [currentExpression, setCurrentExpression] = useState<string>('neutral');
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const faceMeshRef = useRef<any>(null);
+  const selfieSegmentationRef = useRef<any>(null);
+  const cameraRef = useRef<any>(null);
+  const imagesRef = useRef<{[key: string]: HTMLImageElement}>({});
+  
+  // マスク処理用オフスクリーンCanvas
+  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null); // 最終合成用
+  const maskTempCanvasRef = useRef<HTMLCanvasElement | null>(null); // ピクセル処理用(低解像度)
+  const rawSegmentationCanvasRef = useRef<HTMLCanvasElement | null>(null); // セグメンテーション生データ保存用
+
+  const isDraggingRef = useRef(false);
+  const lastMousePosRef = useRef({ x: 0, y: 0 });
+  const lastFaceWidthPxRef = useRef<number>(100); 
+
+  const pendingExpressionRef = useRef<string>('neutral');
+  const expressionDurationRef = useRef<number>(0);
+  const lastFrameTimeRef = useRef<number>(0);
+
+  // --- Keyboard Shortcuts ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'h') {
+        setShowUI(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // --- Load MediaPipe Scripts ---
+  useEffect(() => {
+    const loadScript = (src: string) => {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${src}"]`)) {
+          resolve(true);
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = src;
+        script.crossOrigin = 'anonymous';
+        script.onload = () => resolve(true);
+        script.onerror = () => reject(new Error(`Failed to load ${src}`));
+        document.body.appendChild(script);
+      });
+    };
+
+    const initMediaPipe = async () => {
+      try {
+        await Promise.all([
+            loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js'),
+            loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js'),
+            loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js')
+        ]);
+        
+        setTimeout(() => {
+          setupMediaPipe();
+        }, 1000);
+      } catch (err) {
+        console.error(err);
+        setErrorMsg('ライブラリの読み込みに失敗しました。インターネット接続を確認してリロードしてください。');
+        setIsLoading(false);
+      }
+    };
+
+    initMediaPipe();
+  }, []);
+
+  useEffect(() => {
+    const preloadImg = new Image();
+    preloadImg.src = DEFAULT_Placeholder;
+    imagesRef.current['default'] = preloadImg;
+  }, []);
+
+  useEffect(() => {
+    Object.keys(images).forEach(key => {
+      if (images[key]) {
+        const img = new Image();
+        img.src = images[key]!;
+        imagesRef.current[key] = img;
+      }
+    });
+  }, [images]);
+
+  // カメラ制御
+  useEffect(() => {
+    if (cameraRef.current) {
+      if (isCameraOn) {
+        cameraRef.current.start().catch((e: any) => {
+            console.error("Camera Start Error:", e);
+            setErrorMsg("カメラの起動に失敗しました: " + e.message);
+        });
+      } else {
+         if (videoRef.current && videoRef.current.srcObject) {
+            const stream = videoRef.current.srcObject as MediaStream;
+            stream.getTracks().forEach(track => track.stop());
+            videoRef.current.srcObject = null;
+          }
+          const ctx = canvasRef.current?.getContext('2d');
+          if (ctx && canvasRef.current) {
+            ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          }
+          setIsFaceDetected(false);
+      }
+    }
+  }, [isCameraOn]);
+
+  const setupMediaPipe = () => {
+    const _window = window as any;
+    if (!_window.FaceMesh || !_window.SelfieSegmentation || !_window.Camera) {
+      console.warn("MediaPipe modules not loaded yet, retrying...");
+      setTimeout(setupMediaPipe, 500); 
+      return;
+    }
+
+    try {
+      // 1. Face Mesh Setup
+      const faceMesh = new _window.FaceMesh({
+        locateFile: (file: string) => {
+          return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+        }
+      });
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      faceMesh.onResults(onFaceResults);
+      faceMeshRef.current = faceMesh;
+
+      // 2. Selfie Segmentation Setup
+      const selfieSegmentation = new _window.SelfieSegmentation({
+        locateFile: (file: string) => {
+          return `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`;
+        }
+      });
+      selfieSegmentation.setOptions({
+        modelSelection: 1, 
+      });
+      selfieSegmentation.onResults(onSegmentationResults);
+      selfieSegmentationRef.current = selfieSegmentation;
+
+      // 3. Camera Setup
+      if (videoRef.current) {
+        const camera = new _window.Camera(videoRef.current, {
+          onFrame: async () => {
+            if (videoRef.current && isCameraOnRef.current) {
+              if (videoRef.current.videoWidth === 0 || videoRef.current.videoHeight === 0) return;
+
+              try {
+                  const promises = [];
+                  if (faceMeshRef.current) {
+                      await faceMeshRef.current.send({ image: videoRef.current });
+                  }
+                  // BodyMaskが有効な時だけSegmentationを実行
+                  if (configRef.current.enableBodyMask && selfieSegmentationRef.current) {
+                      await selfieSegmentationRef.current.send({ image: videoRef.current });
+                  }
+              } catch (e) {
+                  console.error("Pipe send error", e);
+              }
+            }
+          },
+          width: 1280,
+          height: 720
+        });
+        cameraRef.current = camera;
+        setIsLoading(false);
+      }
+    } catch (e: any) {
+      console.error("Setup error", e);
+      setErrorMsg("初期化エラー: " + e.message);
+    }
+  };
+
+  const toggleCamera = () => {
+    setIsCameraOn(prev => !prev);
+  };
+
+  const onSegmentationResults = (results: any) => {
+      if (!rawSegmentationCanvasRef.current) {
+          rawSegmentationCanvasRef.current = document.createElement('canvas');
+          rawSegmentationCanvasRef.current.width = results.segmentationMask.width;
+          rawSegmentationCanvasRef.current.height = results.segmentationMask.height;
+      }
+      const rawCanvas = rawSegmentationCanvasRef.current;
+      const ctx = rawCanvas.getContext('2d');
+      if (ctx) {
+          ctx.clearRect(0, 0, rawCanvas.width, rawCanvas.height);
+          ctx.drawImage(results.segmentationMask, 0, 0, rawCanvas.width, rawCanvas.height);
+      }
+  };
+
+  const distance = (p1: any, p2: any) => {
+    return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+  };
+
+  const onFaceResults = (results: any) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    const now = Date.now();
+
+    // Canvasサイズ同期
+    if (!maskCanvasRef.current) maskCanvasRef.current = document.createElement('canvas');
+    if (maskCanvasRef.current.width !== width || maskCanvasRef.current.height !== height) {
+        maskCanvasRef.current.width = width;
+        maskCanvasRef.current.height = height;
+    }
+    // 処理用低解像度Canvas
+    if (!maskTempCanvasRef.current) maskTempCanvasRef.current = document.createElement('canvas');
+    if (maskTempCanvasRef.current.width !== 320 || maskTempCanvasRef.current.height !== 180) {
+        maskTempCanvasRef.current.width = 320;
+        maskTempCanvasRef.current.height = 180;
+    }
+
+    // メインCanvasクリア
+    ctx.save();
+    ctx.clearRect(0, 0, width, height);
+
+    // 顔検出判定
+    const hasFace = results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0;
+    setIsFaceDetected(hasFace);
+
+    // --- 待機モード ---
+    if (!hasFace) {
+        ctx.restore(); 
+        ctx.fillStyle = "black";
+        ctx.fillRect(0, 0, width, height);
+
+        if (standbyImageRef.current && standbyImageRef.current.complete) {
+             const img = standbyImageRef.current;
+             const imgRatio = img.width / img.height;
+             const canvasRatio = width / height;
+             let drawW, drawH, drawX, drawY;
+             if (canvasRatio > imgRatio) {
+                 drawW = width;
+                 drawH = width / imgRatio;
+                 drawX = 0;
+                 drawY = (height - drawH) / 2;
+             } else {
+                 drawH = height;
+                 drawW = height * imgRatio;
+                 drawY = 0;
+                 drawX = (width - drawW) / 2;
+             }
+             ctx.drawImage(img, drawX, drawY, drawW, drawH);
+        } else {
+             ctx.fillStyle = "#333";
+             ctx.font = "bold 30px sans-serif";
+             ctx.textAlign = "center";
+             ctx.fillText("WAITING FOR FACE...", width / 2, height / 2);
+        }
+        return; 
+    }
+
+    // --- レイヤー1: 背景 ---
+    ctx.save();
+    ctx.translate(width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(results.image, 0, 0, width, height);
+    ctx.restore();
+
+    // --- レイヤー2: 顔画像 ---
+    const landmarks = results.multiFaceLandmarks[0];
+    const nose = landmarks[1];
+    const leftCheek = landmarks[234];
+    const rightCheek = landmarks[454];
+
+    const faceWidthRel = distance(leftCheek, rightCheek);
+    const faceWidthPx = faceWidthRel * width;
+    lastFaceWidthPxRef.current = faceWidthPx;
+    const dx = landmarks[263].x - landmarks[33].x;
+    const dy = landmarks[263].y - landmarks[33].y;
+    const angle = Math.atan2(dy, dx); 
+    const x = nose.x * width;
+    const y = nose.y * height;
+
+    // 表情認識
+    const rEyeH = distance(landmarks[33], landmarks[133]);
+    const rEyeV = distance(landmarks[159], landmarks[145]);
+    const rightEAR = rEyeV / rEyeH;
+    const lEyeH = distance(landmarks[362], landmarks[263]);
+    const lEyeV = distance(landmarks[386], landmarks[374]);
+    const leftEAR = lEyeV / lEyeH;
+    const mouthH = distance(landmarks[78], landmarks[308]);
+    const mouthV = distance(landmarks[13], landmarks[14]);
+    const mouthRatio = mouthV / mouthH;
+
+    const { eyeClosedThreshold, mouthOpenThreshold, triggerDuration, enableBodyMask, maskThreshold, faceHoleScale, showMaskDebug, maskCutoffOffset } = configRef.current;
+    
+    let detectedState = 'neutral';
+    for (const key of priorityOrderRef.current) {
+        if (!enabledExpressionsRef.current[key]) continue;
+        if (key === 'mouthOpen' && mouthRatio > mouthOpenThreshold) { detectedState = 'mouthOpen'; break; }
+        if (key === 'winkLeft' && (leftEAR < eyeClosedThreshold) && !(rightEAR < eyeClosedThreshold)) { detectedState = 'winkLeft'; break; }
+        if (key === 'winkRight' && (rightEAR < eyeClosedThreshold) && !(leftEAR < eyeClosedThreshold)) { detectedState = 'winkRight'; break; }
+        if (key === 'neutral') { detectedState = 'neutral'; break; }
+    }
+
+    if (detectedState === pendingExpressionRef.current) {
+        if (lastFrameTimeRef.current > 0) expressionDurationRef.current += (now - lastFrameTimeRef.current);
+    } else {
+        pendingExpressionRef.current = detectedState;
+        expressionDurationRef.current = 0;
+    }
+    lastFrameTimeRef.current = now;
+    
+    let finalState = currentExpression;
+    if (expressionDurationRef.current >= triggerDuration) {
+         setCurrentExpression(pendingExpressionRef.current);
+         finalState = pendingExpressionRef.current;
+    }
+
+    const imgToDraw = imagesRef.current[finalState] || imagesRef.current['neutral'] || imagesRef.current['default'];
+    if (imgToDraw && imgToDraw.complete) {
+        const size = faceWidthPx * configRef.current.scale;
+        ctx.save();
+        const offsetX = configRef.current.offsetX * (faceWidthPx / 100); 
+        const offsetY = configRef.current.offsetY * (faceWidthPx / 100);
+        ctx.translate(width - x + offsetX, y + offsetY); 
+        ctx.rotate(-angle); 
+        ctx.drawImage(imgToDraw, -size / 2, -size / 2, size, size);
+        ctx.restore();
+    }
+
+    // --- レイヤー3: 身体マスク ---
+    if (enableBodyMask && rawSegmentationCanvasRef.current && maskCanvasRef.current && maskTempCanvasRef.current) {
+        const mCtx = maskCanvasRef.current.getContext('2d');
+        const tCtx = maskTempCanvasRef.current.getContext('2d');
+        
+        if (mCtx && tCtx) {
+            const tW = maskTempCanvasRef.current.width;
+            const tH = maskTempCanvasRef.current.height;
+            tCtx.clearRect(0, 0, tW, tH);
+            
+            tCtx.save();
+            tCtx.translate(tW, 0);
+            tCtx.scale(-1, 1);
+            tCtx.drawImage(rawSegmentationCanvasRef.current, 0, 0, tW, tH);
+            tCtx.restore();
+
+            const imageData = tCtx.getImageData(0, 0, tW, tH);
+            const data = imageData.data;
+            const thresholdVal = maskThreshold * 255; 
+
+            for (let i = 0; i < data.length; i += 4) {
+                const confidence = data[i]; 
+                if (confidence > thresholdVal) {
+                    if (showMaskDebug) {
+                        data[i] = 255; // R
+                        data[i+1] = 0; // G
+                        data[i+2] = 0; // B
+                        data[i+3] = 150; // Alpha
+                    } else {
+                        data[i] = 255;
+                        data[i+1] = 255;
+                        data[i+2] = 255;
+                        data[i+3] = 255; 
+                    }
+                } else {
+                    data[i + 3] = 0;   
+                }
+            }
+            tCtx.putImageData(imageData, 0, 0);
+
+            // 顔部分のくり抜き & 頭上の消去
+            if (faceHoleScale > 0) {
+                tCtx.globalCompositeOperation = 'destination-out'; 
+                tCtx.beginPath();
+                
+                const firstPt = landmarks[FACE_OVAL_INDICES[0]];
+                const fx = (1 - firstPt.x) * tW; 
+                const fy = firstPt.y * tH;
+                tCtx.moveTo(fx, fy);
+
+                let centerX = 0, centerY = 0;
+                FACE_OVAL_INDICES.forEach(idx => {
+                   centerX += (1 - landmarks[idx].x) * tW;
+                   centerY += landmarks[idx].y * tH;
+                });
+                centerX /= FACE_OVAL_INDICES.length;
+                centerY /= FACE_OVAL_INDICES.length;
+
+                let maxY = 0; // 顔の下限（顎）のY座標を探す (Yが大きいほど下)
+
+                for (let i = 0; i < FACE_OVAL_INDICES.length; i++) {
+                    const pt = landmarks[FACE_OVAL_INDICES[i]];
+                    const px = (1 - pt.x) * tW;
+                    const py = pt.y * tH;
+                    
+                    const vecX = px - centerX;
+                    const vecY = py - centerY;
+                    const sx = centerX + vecX * faceHoleScale;
+                    const sy = centerY + vecY * faceHoleScale;
+                    
+                    if (sy > maxY) maxY = sy; // 一番低い位置(Y大)＝顎先を更新
+
+                    tCtx.lineTo(sx, sy);
+                }
+                tCtx.closePath();
+                tCtx.fill(); 
+                
+                // 頭上マスク消去 (顎より上を消す)
+                // 常に有効
+                const cutLineY = maxY + maskCutoffOffset;
+                tCtx.fillRect(0, 0, tW, cutLineY);
+                
+                tCtx.globalCompositeOperation = 'source-over'; 
+            }
+
+            mCtx.clearRect(0, 0, width, height);
+            mCtx.drawImage(maskTempCanvasRef.current, 0, 0, width, height);
+
+            if (showMaskDebug) {
+                ctx.drawImage(maskCanvasRef.current, 0, 0);
+            } else {
+                mCtx.globalCompositeOperation = 'source-in';
+                mCtx.save();
+                mCtx.translate(width, 0);
+                mCtx.scale(-1, 1);
+                mCtx.drawImage(results.image, 0, 0, width, height);
+                mCtx.restore();
+                mCtx.globalCompositeOperation = 'source-over';
+
+                ctx.drawImage(maskCanvasRef.current, 0, 0);
+            }
+        }
+    }
+
+    ctx.restore(); 
+  };
+
+  // --- Handlers ---
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, key: string) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        setImages(prev => ({ ...prev, [key]: evt.target?.result as string }));
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleStandbyImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        setStandbyImage(evt.target?.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const movePriority = (index: number, direction: 'up' | 'down') => {
+    const newOrder = [...priorityOrder];
+    if (direction === 'up' && index > 0) {
+      [newOrder[index], newOrder[index - 1]] = [newOrder[index - 1], newOrder[index]];
+    } else if (direction === 'down' && index < newOrder.length - 1) {
+      [newOrder[index], newOrder[index + 1]] = [newOrder[index + 1], newOrder[index]];
+    }
+    setPriorityOrder(newOrder);
+  };
+
+  const toggleExpression = (key: string) => {
+    setEnabledExpressions(prev => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    isDraggingRef.current = true;
+    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDraggingRef.current) return;
+    const dx = e.clientX - lastMousePosRef.current.x;
+    const dy = e.clientY - lastMousePosRef.current.y;
+    lastMousePosRef.current = { x: e.clientX, y: e.clientY };
+
+    const pxPerUnit = lastFaceWidthPxRef.current / 100;
+    if (pxPerUnit < 0.1) return;
+
+    setConfig(prev => ({
+      ...prev,
+      offsetX: prev.offsetX - (dx / pxPerUnit), 
+      offsetY: prev.offsetY + (dy / pxPerUnit), 
+    }));
+  };
+
+  const handleMouseUp = () => { isDraggingRef.current = false; };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    const delta = e.deltaY;
+    const zoomFactor = 0.1;
+    setConfig(prev => {
+      let newScale = prev.scale - (delta > 0 ? zoomFactor : -zoomFactor);
+      newScale = Math.max(0.5, Math.min(newScale, 5.0));
+      return { ...prev, scale: newScale };
+    });
+  };
+
+  return (
+    <div className="relative w-screen h-screen bg-black overflow-hidden" onMouseUp={handleMouseUp}>
+      {/* Hidden Video */}
+      <video ref={videoRef} className="absolute opacity-0 pointer-events-none" playsInline muted width="1280" height="720" />
+
+      {/* Main Canvas */}
+      <div className="absolute inset-0 cursor-move group">
+         <canvas 
+          ref={canvasRef} 
+          className="w-full h-full object-contain transform scale-x-[-1]" 
+          width="1280" 
+          height="720" 
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseLeave={handleMouseUp}
+          onWheel={handleWheel}
+        />
+        
+        {!isCameraOn && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-20 pointer-events-none">
+                <div className="flex flex-col items-center gap-3 text-gray-500/50">
+                    <VideoOff size={64} />
+                    <span className="text-2xl font-bold tracking-widest">CAMERA OFF</span>
+                    <span className="text-sm">設定パネルからONにしてください</span>
+                </div>
+            </div>
+        )}
+        
+        {isCameraOn && !isFaceDetected && !isLoading && (
+            <div className="absolute top-10 left-1/2 transform -translate-x-1/2 bg-red-900/50 text-red-200 px-4 py-1 rounded-full text-xs font-bold border border-red-500/30 z-20 pointer-events-none animate-pulse">
+                顔を認識できません（待機画面中）
+            </div>
+        )}
+
+        {showUI && isCameraOn && (
+          <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-black/50 text-white text-[10px] px-3 py-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10 border border-white/20">
+             ドラッグ: 位置 / ホイール: 拡大 / Hキー: UI切替
+          </div>
+        )}
+      </div>
+
+      {isLoading && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-gray-900/90 text-white z-50">
+          <RefreshCw className="animate-spin mb-4 text-blue-500" size={40} />
+          <p>AIモデルを読み込んでいます...</p>
+          <p className="text-sm text-gray-500 mt-2">（初回のみロードに時間がかかります）</p>
+        </div>
+      )}
+      
+      {errorMsg && (
+        <div className="absolute inset-0 flex items-center justify-center bg-red-900/90 text-white z-50 p-6 text-center">
+          <p>{errorMsg}</p>
+        </div>
+      )}
+
+      {/* UI Overlay */}
+      {showUI && (
+        <>
+            {isCameraOn && isFaceDetected && (
+                <div className="absolute top-4 left-4 bg-black/60 backdrop-blur-md px-4 py-2 rounded-full text-sm font-mono text-green-400 border border-white/10 flex items-center gap-3 shadow-lg z-30">
+                    <span className={`w-2.5 h-2.5 rounded-full ${currentExpression !== 'neutral' ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`}></span>
+                    <span className="font-bold">{EXPRESSION_TYPES[currentExpression as ExpressionKey]?.label}</span>
+                </div>
+            )}
+
+            {/* Controls Sidebar */}
+            <div className="absolute top-4 right-4 bottom-4 w-80 bg-gray-900/85 backdrop-blur-md border border-gray-700/50 rounded-2xl shadow-2xl flex flex-col overflow-hidden z-30 transition-all duration-300">
+                
+                <div className="p-4 border-b border-gray-700/50 flex items-center justify-between bg-gray-800/50">
+                    <div className="flex items-center gap-2">
+                        <Camera size={18} className="text-blue-400" />
+                        <span className="font-bold text-sm tracking-wide">設定 (Hide: 'H')</span>
+                    </div>
+                    <button onClick={() => setShowUI(false)} className="text-gray-400 hover:text-white transition-colors">
+                        <X size={18} />
+                    </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto custom-scrollbar p-3">
+                    
+                    {/* Device & Mask Control */}
+                    <div className="mb-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700/50">
+                        <div className="flex items-center justify-between mb-3 pb-3 border-b border-gray-700/50">
+                            <div className="flex items-center gap-2 text-gray-300">
+                                {isCameraOn ? <Video size={16} className="text-green-400" /> : <VideoOff size={16} className="text-red-400" />}
+                                <span className="text-xs font-bold">カメラ映像</span>
+                            </div>
+                            <button
+                                onClick={toggleCamera}
+                                className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold transition-all ${
+                                    isCameraOn 
+                                    ? 'bg-green-500/20 text-green-400 border border-green-500/30 hover:bg-green-500/30' 
+                                    : 'bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30'
+                                }`}
+                            >
+                                {isCameraOn ? 'ON' : 'OFF'}
+                            </button>
+                        </div>
+                        
+                        {/* Mask Controls */}
+                        <div className="space-y-3">
+                             <div className="flex items-center justify-between">
+                                 <div className="flex items-center gap-2 text-gray-300">
+                                    <Layers size={16} className={config.enableBodyMask ? "text-purple-400" : "text-gray-500"} />
+                                    <span className="text-xs font-bold">身体マスク (手前表示)</span>
+                                 </div>
+                                 <button
+                                    onClick={() => setConfig(prev => ({...prev, enableBodyMask: !prev.enableBodyMask}))}
+                                    className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-bold transition-all ${
+                                        config.enableBodyMask
+                                        ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30 hover:bg-purple-500/30' 
+                                        : 'bg-gray-700 text-gray-400 border border-gray-600 hover:bg-gray-600'
+                                    }`}
+                                >
+                                    {config.enableBodyMask ? 'ON' : 'OFF'}
+                                </button>
+                             </div>
+                             
+                             {config.enableBodyMask && (
+                                 <div className="bg-black/30 p-2 rounded space-y-2">
+                                    <div className="space-y-1">
+                                        <div className="flex justify-between text-[10px] text-gray-400">
+                                            <span>マスク範囲 (Threshold)</span>
+                                            <span>{config.maskThreshold.toFixed(2)}</span>
+                                        </div>
+                                        <input type="range" min="0.1" max="0.9" step="0.05" value={config.maskThreshold} onChange={(e) => setConfig({...config, maskThreshold: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-purple-500" />
+                                    </div>
+                                    <div className="space-y-1">
+                                        <div className="flex justify-between text-[10px] text-gray-400">
+                                            <span className="flex items-center gap-1"><UserMinus size={10}/> 顔くり抜きサイズ (Face Scale)</span>
+                                            <span>{config.faceHoleScale.toFixed(1)}x</span>
+                                        </div>
+                                        <input type="range" min="0.0" max="2.0" step="0.1" value={config.faceHoleScale} onChange={(e) => setConfig({...config, faceHoleScale: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-purple-500" />
+                                    </div>
+                                    
+                                    {/* Cutoff Y Slider */}
+                                     <div className="space-y-1 pt-2 mt-1 border-t border-white/10">
+                                        <div className="flex justify-between text-[10px] text-gray-400">
+                                            <span className="flex items-center gap-1"><Scissors size={10}/> マスク削除ライン (Y軸調整)</span>
+                                            <span>{config.maskCutoffOffset}px</span>
+                                        </div>
+                                        <input type="range" min="-100" max="100" step="1" value={config.maskCutoffOffset} onChange={(e) => setConfig({...config, maskCutoffOffset: parseInt(e.target.value)})} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-blue-400" />
+                                        <p className="text-[8px] text-gray-500">あごの位置(0)から上下に削除ラインを調整します</p>
+                                    </div>
+
+                                    {/* Debug Switch */}
+                                    <div className="flex items-center justify-between pt-1 mt-1 border-t border-white/10">
+                                        <span className="flex items-center gap-1 text-[10px] text-red-300"><ScanEye size={10}/> 赤色表示(Debug)</span>
+                                        <button
+                                            onClick={() => setConfig(prev => ({...prev, showMaskDebug: !prev.showMaskDebug}))}
+                                            className={`text-[10px] font-bold transition-colors ${config.showMaskDebug ? 'text-red-400' : 'text-gray-600'}`}
+                                        >
+                                            {config.showMaskDebug ? "ON" : "OFF"}
+                                        </button>
+                                    </div>
+                                 </div>
+                             )}
+                        </div>
+                    </div>
+
+                    {/* Standby Image */}
+                    <div className="mb-4 p-3 bg-gray-800/50 rounded-lg border border-gray-700/50">
+                        <div className="flex items-center gap-2 text-gray-300 mb-2">
+                             <UserX size={16} className="text-orange-400" />
+                             <span className="text-xs font-bold">待機画像 (顔ロスト時)</span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                             <div className="w-10 h-10 bg-black/40 rounded border border-gray-600/50 overflow-hidden flex-shrink-0 relative">
+                                {standbyImage ? (
+                                    <img src={standbyImage} alt="" className="w-full h-full object-cover" />
+                                ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-[8px] text-gray-500 text-center">No Img<br/>(Black)</div>
+                                )}
+                            </div>
+                            <label className="flex-1 cursor-pointer">
+                                <div className="bg-gray-700 hover:bg-gray-600 text-[10px] text-center py-1.5 rounded border border-gray-600/30 text-gray-300 transition-colors">
+                                    画像を設定
+                                </div>
+                                <input type="file" accept="image/*" className="hidden" onChange={handleStandbyImageUpload} />
+                            </label>
+                            {standbyImage && (
+                                <button onClick={() => setStandbyImage(null)} className="text-[10px] text-red-400 hover:text-red-300">削除</button>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Expression Settings */}
+                    <div className="mb-6">
+                        <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-3 px-1 flex items-center gap-2">
+                            <ToggleLeft size={12}/> 表情認識設定 (優先度順)
+                        </h3>
+                        <div className="space-y-2">
+                            {priorityOrder.map((key, index) => (
+                                <div key={key} className={`bg-black/40 rounded-lg p-2 border transition-all ${
+                                    !enabledExpressions[key] ? 'border-gray-800 opacity-60' :
+                                    (isCameraOn && isFaceDetected && key === currentExpression) ? 'border-green-500/60 shadow-[0_0_8px_rgba(34,197,94,0.15)] bg-green-900/10' : 'border-gray-700 hover:border-blue-500/30'
+                                }`}>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            <span className="w-5 h-5 flex items-center justify-center bg-gray-800 rounded text-[10px] text-gray-400 font-mono">
+                                                {index + 1}
+                                            </span>
+                                            <div className="flex items-center gap-2">
+                                                <span className={`${enabledExpressions[key] ? 'text-gray-200' : 'text-gray-500'}`}>
+                                                    {EXPRESSION_TYPES[key].icon}
+                                                </span>
+                                                <span className={`text-xs font-medium ${enabledExpressions[key] ? 'text-gray-200' : 'text-gray-500'}`}>
+                                                    {EXPRESSION_TYPES[key].label}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        <button 
+                                            onClick={() => toggleExpression(key)}
+                                            className={`transition-colors ${enabledExpressions[key] ? 'text-green-400' : 'text-gray-600'}`}
+                                        >
+                                            {enabledExpressions[key] ? <ToggleRight size={22} /> : <ToggleLeft size={22} />}
+                                        </button>
+                                    </div>
+                                    <div className="flex items-center gap-2 pl-7">
+                                        <div className="w-8 h-8 bg-gray-800 rounded border border-gray-600/50 overflow-hidden relative">
+                                            {images[key] ? (
+                                                <img src={images[key]!} alt="" className="w-full h-full object-cover" />
+                                            ) : (
+                                                <div className="w-full h-full flex items-center justify-center"><span className="text-[8px] text-gray-500">None</span></div>
+                                            )}
+                                        </div>
+                                        <label className="flex-1 cursor-pointer">
+                                            <div className="bg-gray-800 hover:bg-gray-700 text-[10px] text-center py-1 rounded border border-gray-600/30 text-gray-400 hover:text-white transition-colors">
+                                                画像変更
+                                            </div>
+                                            <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageUpload(e, key)} />
+                                        </label>
+                                        <div className="flex flex-col gap-0.5">
+                                            <button onClick={() => movePriority(index, 'up')} disabled={index === 0} className="text-gray-500 hover:text-blue-400 disabled:opacity-20"><ArrowUp size={12}/></button>
+                                            <button onClick={() => movePriority(index, 'down')} disabled={index === priorityOrder.length - 1} className="text-gray-500 hover:text-blue-400 disabled:opacity-20"><ArrowDown size={12}/></button>
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Face Adjustments */}
+                    <div className="p-2 border-t border-gray-700/50 pt-4">
+                        <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-3 px-1 flex items-center gap-2">
+                            <Sliders size={12} /> 顔・表情設定
+                        </h3>
+
+                        <div className="space-y-4 mb-6 bg-black/20 p-3 rounded-lg">
+                            <div className="space-y-1 pb-3 border-b border-white/5">
+                                <div className="flex justify-between text-[10px] text-blue-300">
+                                    <span className="flex items-center gap-1"><Clock size={10}/> 認識待機時間 (瞬き防止)</span>
+                                    <span>{config.triggerDuration} ms</span>
+                                </div>
+                                <input type="range" min="0" max="1000" step="50" value={config.triggerDuration} onChange={(e) => setConfig({...config, triggerDuration: parseInt(e.target.value)})} className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-400" />
+                            </div>
+
+                            <div className="space-y-1">
+                                <div className="flex justify-between text-[10px] text-gray-400"><span>目の閉じ感度</span><span>{config.eyeClosedThreshold.toFixed(2)}</span></div>
+                                <input type="range" min="0.05" max="0.7" step="0.01" value={config.eyeClosedThreshold} onChange={(e) => setConfig({...config, eyeClosedThreshold: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-green-500" />
+                            </div>
+                            <div className="space-y-1">
+                                <div className="flex justify-between text-[10px] text-gray-400"><span>口の開き感度</span><span>{config.mouthOpenThreshold.toFixed(2)}</span></div>
+                                <input type="range" min="0.1" max="0.8" step="0.05" value={config.mouthOpenThreshold} onChange={(e) => setConfig({...config, mouthOpenThreshold: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-green-500" />
+                            </div>
+                        </div>
+
+                        <div className="space-y-3 px-1">
+                            <div className="space-y-1">
+                                <div className="flex justify-between text-[10px] text-gray-400"><span>サイズ (Scale)</span><span>{config.scale.toFixed(1)}x</span></div>
+                                <input type="range" min="0.5" max="4.0" step="0.1" value={config.scale} onChange={(e) => setConfig({...config, scale: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                                <div className="space-y-1">
+                                    <div className="flex justify-between text-[10px] text-gray-400"><span>Pos X</span><span>{config.offsetX.toFixed(0)}</span></div>
+                                    <input type="range" min="-200" max="200" value={config.offsetX} onChange={(e) => setConfig({...config, offsetX: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+                                </div>
+                                <div className="space-y-1">
+                                    <div className="flex justify-between text-[10px] text-gray-400"><span>Pos Y</span><span>{config.offsetY.toFixed(0)}</span></div>
+                                    <input type="range" min="-200" max="200" value={config.offsetY} onChange={(e) => setConfig({...config, offsetY: parseFloat(e.target.value)})} className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500" />
+                                </div>
+                            </div>
+                        </div>
+
+                         <div className="mt-6 flex">
+                            <button 
+                            onClick={() => setConfig({ 
+                                scale: 1.5, offsetX: 0, offsetY: 0, 
+                                eyeClosedThreshold: 0.12, mouthOpenThreshold: 0.3, 
+                                triggerDuration: 200, enableBodyMask: true,
+                                maskThreshold: 0.5, faceHoleScale: 1.1, showMaskDebug: false, maskCutoffOffset: 0 
+                            })}
+                            className="flex-1 bg-gray-800 hover:bg-gray-700 text-[10px] py-2 rounded text-gray-400 transition-colors border border-gray-700"
+                            >
+                            設定リセット
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+export default App;
